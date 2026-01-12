@@ -1,0 +1,20 @@
+services:
+  web:
+    build: .
+    container_name: dapp2_web
+    command: gunicorn core.wsgi:application --bind 0.0.0.0:8000
+    volumes:
+      - static_volume:/app/static
+    env_file:
+      - .env
+    expose:
+      - "8000"
+    networks:
+      - backend
+
+networks:
+  backend:
+    external: true   # join the shared reverse-proxy network
+
+volumes:
+  static_volume:
