@@ -1,0 +1,10 @@
+myapp.mydomain.com {
+        @allowed remote_ip my_public_ip 10.1.32.0/24
+
+        handle @allowed {
+                reverse_proxy 127.0.0.1:0000 {
+                }
+        }
+
+        respond "Forbidden" 403
+}
