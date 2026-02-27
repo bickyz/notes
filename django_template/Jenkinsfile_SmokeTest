@@ -1,0 +1,52 @@
+pipeline {
+  agent any
+
+  environment {
+    HOST_IP  = '192.168.240.12'
+    SSH_USER = 'rgsadmin'
+  }
+
+  stages {
+    stage('Checkout test') {
+      steps {
+        // If your job is "Pipeline script from SCM", Jenkins will already checkout automatically.
+        // But this proves credentials and branch are correct.
+        sh 'git rev-parse --short HEAD'
+        sh 'git status --porcelain || true'
+      }
+    }
+
+    stage('Docker access test on Jenkins') {
+      steps {
+        sh 'docker version'
+        sh 'docker info | head -n 30'
+      }
+    }
+
+    stage('SSH access test to Ubuntu') {
+      steps {
+        sshagent(credentials: ['a2d57dae-cb52-43dc-8315-d9c23235cac5']) {
+          sh """
+            ssh -o StrictHostKeyChecking=no ${SSH_USER}@${HOST_IP} 'whoami && hostname && uptime'
+          """
+        }
+      }
+    }
+
+    stage('Ubuntu docker + sudo test (no changes)') {
+      steps {
+        sshagent(credentials: ['a2d57dae-cb52-43dc-8315-d9c23235cac5']) {
+          sh """
+            ssh -o StrictHostKeyChecking=no ${SSH_USER}@${HOST_IP} '
+              set -e
+              docker ps >/dev/null
+              sudo -n /bin/systemctl is-active caddy >/dev/null
+              sudo -n /usr/bin/caddy version >/dev/null
+              echo "OK: docker + sudo non-interactive works"
+            '
+          """
+        }
+      }
+    }
+  }
+}
