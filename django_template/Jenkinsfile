@@ -170,7 +170,7 @@ pipeline {
               printf '%s\n' \
               "${DOMAIN} {" \
               "" \
-              "  @allowed remote_ip 1.2.3.4 10.1.32.0/24" \
+              "  @allowed remote_ip my_public_ip 10.1.32.0/24" \
               "  handle @allowed {" \
               "    reverse_proxy 127.0.0.1:${USEDPORT}" \
               "  }" \
