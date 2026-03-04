@@ -1,0 +1,228 @@
+pipeline {
+  agent any
+
+  environment {
+    APP_NAME      = '123calendar'
+    IMAGE_NAME    = '123calendar_image'
+    HOST_IP       = '192.168.240.12'
+    SSH_USER      = 'myadmin'
+    REMOTE_APPDIR = "/srv/123calendar"
+    REMOTE_TMP    = "/srv/123calendar/mytemp"
+    DOCKER_NET    = '123calendar_net'
+    DOMAIN        = '123calendar.mydomain.com'
+
+    HEALTH_PATH   = '/health'
+    KEEP_IMAGES   = '5'
+  }
+
+  stages {
+
+//     stage('Debug: Jenkinsfile version') {
+//   steps {
+//     sh 'echo "GIT SHA: $(git rev-parse --short HEAD)"'
+//     sh 'grep -n "remote_ip" -n Jenkinsfile || true'
+//   }
+// }
+
+    stage('Checkout from Azure DevOps') {
+      steps {
+        checkout([$class: 'GitSCM',
+          branches: [[name: '*/master']],
+          userRemoteConfigs: [[
+            url: 'https://mycompany@dev.azure.com/mycompany/123calendar/_git/123calendar',
+            credentialsId: '3306774a-8598-4bc2-8e37-f19f198b2c1c'
+          ]]
+        ])
+      }
+    }
+
+    stage('Compute Version Tag (ddMM-HHmm-SHA)') {
+      steps {
+        script {
+          def DATE_TAG = sh(script: "date +%d%m-%H%M", returnStdout: true).trim()
+          def GIT_SHA  = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+          env.VERSION_TAG = "${DATE_TAG}-${GIT_SHA}"
+          env.GIT_SHA = GIT_SHA
+        }
+      }
+    }
+
+    stage('Build Docker Image (SHA + latest)') {
+      steps {
+        sh """
+          docker build -t ${IMAGE_NAME}:${VERSION_TAG} .
+          docker tag ${IMAGE_NAME}:${VERSION_TAG} ${IMAGE_NAME}:latest
+        """
+      }
+    }
+
+    stage('Save Image as Tar') {
+      steps {
+        sh """
+          mkdir -p mytemp
+          docker save ${IMAGE_NAME}:${VERSION_TAG} -o mytemp/${APP_NAME}_${VERSION_TAG}.tar
+        """
+      }
+    }
+
+    stage('Upload Image to Ubuntu Server') {
+      steps {
+        sshagent(credentials: ['ssh-credentials-goes-here']) {
+          sh """
+            ssh -o StrictHostKeyChecking=no ${SSH_USER}@${HOST_IP} "mkdir -p ${REMOTE_TMP}"
+            scp -o StrictHostKeyChecking=no mytemp/${APP_NAME}_${VERSION_TAG}.tar ${SSH_USER}@${HOST_IP}:${REMOTE_TMP}/
+          """
+        }
+      }
+    }
+
+    stage('Deploy with Health Check + History + Prune') {
+      steps {
+        sshagent(credentials: ['ssh-credentials-goes-here']) {
+          sh '''
+            set -e
+
+            ssh -o StrictHostKeyChecking=no "$SSH_USER@$HOST_IP" \
+              "APP_NAME='$APP_NAME' \
+               IMAGE_NAME='$IMAGE_NAME' \
+               VERSION_TAG='$VERSION_TAG' \
+               GIT_SHA='$GIT_SHA' \
+               REMOTE_APPDIR='$REMOTE_APPDIR' \
+               REMOTE_TMP='$REMOTE_TMP' \
+               DOCKER_NET='$DOCKER_NET' \
+               DOMAIN='$DOMAIN' \
+               KEEP_IMAGES='$KEEP_IMAGES' \
+               HEALTH_PATH='$HEALTH_PATH' \
+               bash -se" <<'REMOTE'
+              set -e
+
+              APP="$APP_NAME"
+              IMG="$IMAGE_NAME"
+              TAG="$VERSION_TAG"
+              APPDIR="$REMOTE_APPDIR"
+              TMPDIR="$REMOTE_TMP"
+              NET="$DOCKER_NET"
+              DOMAIN="$DOMAIN"
+              KEEP="$KEEP_IMAGES"
+              HEALTH_PATH="$HEALTH_PATH"
+
+              mkdir -p "$APPDIR/logs" "$TMPDIR"
+
+              # Determine current host port (keep stable); default if first deploy
+              USEDPORT=""
+
+              if docker inspect "${APP}_web" >/dev/null 2>&1; then
+                USEDPORT=$(docker inspect -f '{{(index (index .HostConfig.PortBindings "8000/tcp") 0).HostPort}}' "${APP}_web" 2>/dev/null || true)
+              fi
+
+              # If empty/invalid/zero, choose a free port starting from 8001
+              if [ -z "$USEDPORT" ] || [ "$USEDPORT" = "0" ]; then
+                BASE_PORT=8001
+                while true; do
+                  if ! ss -ltn | awk '{print $4}' | grep -q ":${BASE_PORT}$"; then
+                    USEDPORT=$BASE_PORT
+                    break
+                  fi
+                  BASE_PORT=$((BASE_PORT + 1))
+                done
+              fi
+
+              echo "Using host port: $USEDPORT"
+
+              # Load new image tar
+              docker load -i "$TMPDIR/${APP}_${TAG}.tar"
+
+              rm -f "$TMPDIR/${APP}_${TAG}.tar"
+
+              # Stop old container
+              docker stop "${APP}_web" || true
+              docker rm "${APP}_web" || true
+
+              # Start new container with immutable tag
+              docker run -d \
+                --name "${APP}_web" \
+                -p 127.0.0.1:${USEDPORT}:8000 \
+                --env-file "$APPDIR/.env" \
+                -v "$APPDIR/data:/app/data:ro" \
+                --network "$NET" \
+                --restart unless-stopped \
+                "$IMG:$TAG"
+
+              # Health check loop (wait up to 60s)
+              echo "Health-checking: http://127.0.0.1:${USEDPORT}${HEALTH_PATH}"
+              OK=0
+              for i in $(seq 1 12); do
+                if curl -fsS "http://127.0.0.1:${USEDPORT}${HEALTH_PATH}" >/dev/null 2>&1; then
+                  OK=1
+                  break
+                fi
+                sleep 5
+              done
+
+              if [ "$OK" -ne 1 ]; then
+                echo "❌ Health check failed. Keeping container logs for debug."
+                docker logs --tail=200 "${APP}_web" || true
+                exit 1
+              fi
+              echo "✅ Health check passed."
+
+              # Update Caddy snippet (IP allowlist: public IP + LAN subnet)
+              printf '%s\n' \
+              "${DOMAIN} {" \
+              "" \
+              "  @allowed remote_ip 1.2.3.4 10.1.32.0/24" \
+              "  handle @allowed {" \
+              "    reverse_proxy 127.0.0.1:${USEDPORT}" \
+              "  }" \
+              "" \
+              "  handle {" \
+              "    respond \"Forbidden\" 403" \
+              "  }" \
+              "}" \
+              > "/tmp/${APP}.caddy"
+
+              sudo mv "/tmp/${APP}.caddy" "/etc/caddy/sites-enabled/${APP}.caddy"
+              echo "=== Updated caddy file ==="
+              #sudo ls -l "/etc/caddy/sites-enabled/${APP}.caddy"
+              #sudo sed -n '1,120p' "/etc/caddy/sites-enabled/${APP}.caddy"
+              sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+              sudo systemctl reload caddy
+
+              # Deployment history log
+              TS=$(date -Is)
+              BUILD_URL="${BUILD_URL:-}"
+              echo "$TS | $APP | $TAG | $GIT_SHA | $USEDPORT | $BUILD_URL" | sudo tee -a "$APPDIR/logs/deploy_history.log" >/dev/null
+
+              # Prune old images: keep latest + last N immutable tags
+              echo "Pruning old images for $IMG (keep $KEEP + latest)..."
+              OLD_TAGS=$(
+                docker images "$IMG" --format "{{.Tag}} {{.CreatedAt}}" \
+                  | awk '$1 != "latest" {print $0}' \
+                  | sort -r \
+                  | awk '{print $1}' \
+                  | tail -n +$((KEEP + 1)) \
+                  || true
+              )
+
+              if [ -n "$OLD_TAGS" ]; then
+                for t in $OLD_TAGS; do
+                  echo "Removing image: $IMG:$t"
+                  docker rmi "$IMG:$t" || true
+                done
+              fi
+
+              echo "✅ Deployment completed successfully."
+REMOTE
+          '''
+        }
+      }
+    }
+
+    stage('Cleanup Local Tar') {
+      steps {
+        sh "rm -rf mytemp || true"
+      }
+    }
+
+  } // end stages
+} // end pipeline
