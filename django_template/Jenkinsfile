@@ -30,7 +30,7 @@ pipeline {
           branches: [[name: '*/master']],
           userRemoteConfigs: [[
             url: 'https://mycompany@dev.azure.com/mycompany/123calendar/_git/123calendar',
-            credentialsId: '3306774a-8598-4bc2-8e37-f19f198b2c1c'
+            credentialsId: 'AZ-PAT-credentials-goes-here'
           ]]
         ])
       }
