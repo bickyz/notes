@@ -1,0 +1,11 @@
+# Secrets & credentials
+.env
+.env.*
+*.pem
+*.key
+secrets/
+config/secrets.yml
+
+# Other sensitive files
+credentials.json
+service-account.json
